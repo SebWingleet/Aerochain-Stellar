@@ -1,0 +1,447 @@
+#![no_std]
+use soroban_sdk::{
+    contract, contractimpl, contracttype, 
+    Address, Env, String, Map, Symbol, Vec, 
+    symbol, log
+};
+
+// Définition des symboles pour les clés de stockage
+const ADMINS: Symbol = Symbol::short("ADMINS");
+const OEM_ORGS: Symbol = Symbol::short("OEM_ORGS");
+const MRO_ORGS: Symbol = Symbol::short("MRO_ORGS");
+const PARTS: Symbol = Symbol::short("PARTS");
+
+// Types d'organisations autorisées
+#[derive(Clone, Copy)]
+#[contracttype]
+pub enum OrgType {
+    OEM,     // Original Equipment Manufacturer
+    MRO,     // Maintenance, Repair, and Operations
+    Airline, // Compagnie aérienne
+    Lessor,  // Société de leasing
+    Distributor, // Distributeur certifié
+}
+
+// Structure d'une organisation
+#[derive(Clone)]
+#[contracttype]
+pub struct Organization {
+    id: Address,
+    name: String,
+    org_type: OrgType,
+    certificates: Vec<String>,
+    active: bool,
+}
+
+// Statut d'une pièce
+#[derive(Clone, Copy, PartialEq)]
+#[contracttype]
+pub enum PartStatus {
+    Active,
+    InMaintenance,
+    Retired,
+    Quarantined,
+}
+
+// Structure d'une pièce aéronautique
+#[contracttype]
+#[derive(Clone)]
+pub struct AeronauticPart {
+    uid: String,
+    part_number: String,
+    serial_number: String,
+    manufacturer: Address,
+    date_of_manufacture: u64, // Timestamp Unix
+    current_owner: Address,
+    status: PartStatus,
+    total_hours: u32,
+    total_cycles: u32,
+    last_updated: u64, // Timestamp Unix
+    document_hashes: Map<String, String>, // Nom du document -> Hash
+}
+
+// Définir les codes d'erreur en utilisant u32
+// C'est une approche compatible avec Soroban
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[contracttype]
+pub enum ErrorCode {
+    NotAuthorized = 1,
+    OrgNotRegistered = 2,
+    NotAnOEM = 3,
+    PartAlreadyExists = 4,
+    PartNotFound = 5,
+    InvalidInput = 6,
+}
+
+#[contract]
+pub struct PartsRegistry;
+
+#[contractimpl]
+impl PartsRegistry {
+    // Fonction d'initialisation du contrat
+    pub fn initialize(env: &Env, admin: Address) {
+        // Vérifier que le contrat n'est pas déjà initialisé
+        if env.storage().instance().has(&ADMINS) {
+            panic!("Contract already initialized");
+        }
+        
+        // Vérifier l'identité de l'administrateur
+        admin.require_auth();
+        
+        // Enregistrer l'administrateur
+        let mut admins = Vec::new(env);
+        admins.push_back(admin.clone());
+        env.storage().instance().set(&ADMINS, &admins);
+        
+        // Initialiser les collections
+        let oem_orgs: Vec<Organization> = Vec::new(env);
+        let mro_orgs: Vec<Organization> = Vec::new(env);
+        let parts: Map<String, AeronauticPart> = Map::new(env);
+        
+        env.storage().instance().set(&OEM_ORGS, &oem_orgs);
+        env.storage().instance().set(&MRO_ORGS, &mro_orgs);
+        env.storage().instance().set(&PARTS, &parts);
+        
+        // Étendre la durée de vie du stockage (5 ans en nombre de ledgers, estimation)
+        // Avec un ledger toutes les 5 secondes: 5 ans ≈ 31,536,000 secondes / 5 = 6,307,200 ledgers
+        env.storage().instance().extend_ttl(1000, 6_307_200);
+        
+        log!(env, "Contract initialized with admin: {}", admin);
+    }
+    
+    // Enregistrer une nouvelle organisation OEM
+    pub fn register_oem(
+        env: &Env, 
+        caller: Address, 
+        org_address: Address, 
+        name: String, 
+        certificates: Vec<String>
+    ) {
+        // Vérifier que l'appelant est un administrateur
+        caller.require_auth();
+        Self::ensure_is_admin(env, &caller);
+        
+        // Créer l'organisation
+        let org = Organization {
+            id: org_address.clone(),
+            name,
+            org_type: OrgType::OEM,
+            certificates,
+            active: true,
+        };
+        
+        // Récupérer et mettre à jour la liste des OEMs
+        let mut oem_orgs: Vec<Organization> = env.storage().instance().get(&OEM_ORGS).unwrap_or(Vec::new(env));
+        oem_orgs.push_back(org);
+        env.storage().instance().set(&OEM_ORGS, &oem_orgs);
+        
+        log!(env, "Registered new OEM: {}", org_address);
+    }
+    
+    // Enregistrer une nouvelle organisation MRO
+    pub fn register_mro(
+        env: &Env, 
+        caller: Address, 
+        org_address: Address, 
+        name: String, 
+        certificates: Vec<String>
+    ) {
+        // Vérifier que l'appelant est un administrateur
+        caller.require_auth();
+        Self::ensure_is_admin(env, &caller);
+        
+        // Créer l'organisation
+        let org = Organization {
+            id: org_address.clone(),
+            name,
+            org_type: OrgType::MRO,
+            certificates,
+            active: true,
+        };
+        
+        // Récupérer et mettre à jour la liste des MROs
+        let mut mro_orgs: Vec<Organization> = env.storage().instance().get(&MRO_ORGS).unwrap_or(Vec::new(env));
+        mro_orgs.push_back(org);
+        env.storage().instance().set(&MRO_ORGS, &mro_orgs);
+        
+        log!(env, "Registered new MRO: {}", org_address);
+    }
+    
+    // Créer une nouvelle pièce aéronautique
+    pub fn create_part(
+        env: &Env,
+        manufacturer: Address,
+        uid: String,
+        part_number: String,
+        serial_number: String,
+        document_hashes: Map<String, String>
+    ) {
+        // Vérifier l'autorisation du fabricant
+        manufacturer.require_auth();
+        
+        // Vérifier que le fabricant est un OEM enregistré
+        Self::ensure_is_oem(env, &manufacturer);
+        
+        // Vérifier que la pièce n'existe pas déjà
+        let parts: Map<String, AeronauticPart> = env.storage().instance().get(&PARTS).unwrap_or(Map::new(env));
+        if parts.contains_key(uid.clone()) {
+            panic!("Part already exists");
+        }
+        
+        // Créer la pièce
+        let current_time = env.ledger().timestamp();
+        let part = AeronauticPart {
+            uid: uid.clone(),
+            part_number,
+            serial_number,
+            manufacturer: manufacturer.clone(),
+            date_of_manufacture: current_time,
+            current_owner: manufacturer.clone(), // Le fabricant est le propriétaire initial
+            status: PartStatus::Active,
+            total_hours: 0,
+            total_cycles: 0,
+            last_updated: current_time,
+            document_hashes,
+        };
+        
+        // Ajouter la pièce au registre
+        let mut updated_parts = parts.clone();
+        updated_parts.set(uid.clone(), part);
+        env.storage().instance().set(&PARTS, &updated_parts);
+        
+        // Prolonger la durée de vie du stockage
+        env.storage().instance().extend_ttl(1000, 6_307_200);
+        
+        log!(env, "Created new part: {} by manufacturer: {}", uid, manufacturer);
+    }
+    
+    // Obtenir les informations d'une pièce
+    pub fn get_part(env: &Env, uid: String) -> Option<AeronauticPart> {
+        let parts: Map<String, AeronauticPart> = env.storage().instance().get(&PARTS).unwrap_or(Map::new(env));
+        parts.get(uid)
+    }
+    
+    // Transférer la propriété d'une pièce
+    pub fn transfer_ownership(
+        env: &Env,
+        current_owner: Address,
+        new_owner: Address,
+        uid: String
+    ) {
+        // Vérifier l'autorisation du propriétaire actuel
+        current_owner.require_auth();
+        
+        // Récupérer les pièces
+        let parts: Map<String, AeronauticPart> = env.storage().instance().get(&PARTS).unwrap_or(Map::new(env));
+        
+        // Vérifier que la pièce existe
+        let part = match parts.get(uid.clone()) {
+            Some(p) => p,
+            None => panic!("Part not found"),
+        };
+        
+        // Vérifier que l'appelant est bien le propriétaire actuel
+        if part.current_owner != current_owner {
+            panic!("Not authorized");
+        }
+        
+        // Mettre à jour la propriété
+        let current_time = env.ledger().timestamp();
+        let mut updated_part = part.clone();
+        updated_part.current_owner = new_owner.clone();
+        updated_part.last_updated = current_time;
+        
+        // Mettre à jour le registre
+        let mut updated_parts = parts.clone();
+        updated_parts.set(uid.clone(), updated_part);
+        env.storage().instance().set(&PARTS, &updated_parts);
+        
+        // Prolonger la durée de vie du stockage
+        env.storage().instance().extend_ttl(1000, 6_307_200);
+        
+        log!(env, "Transferred ownership of part: {} from: {} to: {}", uid, current_owner, new_owner);
+    }
+    
+    // Mettre à jour le statut d'une pièce (pour maintenance)
+    pub fn update_part_status(
+        env: &Env,
+        authorized_org: Address,
+        uid: String,
+        new_status: PartStatus,
+        hours: u32,
+        cycles: u32
+    ) {
+        // Vérifier l'autorisation de l'organisation
+        authorized_org.require_auth();
+        
+        // Vérifier que l'organisation est un MRO ou le propriétaire
+        Self::ensure_is_mro_or_owner(env, &authorized_org, &uid);
+        
+        // Récupérer les pièces
+        let parts: Map<String, AeronauticPart> = env.storage().instance().get(&PARTS).unwrap_or(Map::new(env));
+        
+        // Vérifier que la pièce existe
+        let part = match parts.get(uid.clone()) {
+            Some(p) => p,
+            None => panic!("Part not found"),
+        };
+        
+        // Mettre à jour le statut et les compteurs
+        let current_time = env.ledger().timestamp();
+        let mut updated_part = part.clone();
+        updated_part.status = new_status;
+        updated_part.total_hours = hours;
+        updated_part.total_cycles = cycles;
+        updated_part.last_updated = current_time;
+        
+        // Mettre à jour le registre
+        let mut updated_parts = parts.clone();
+        updated_parts.set(uid.clone(), updated_part);
+        env.storage().instance().set(&PARTS, &updated_parts);
+        
+        // Prolonger la durée de vie du stockage
+        env.storage().instance().extend_ttl(1000, 6_307_200);
+        
+        log!(env, "Updated status of part: {} to: {:?} by: {}", uid, new_status, authorized_org);
+    }
+    
+    // Ajouter un document à une pièce
+    pub fn add_document(
+        env: &Env,
+        authorized_org: Address,
+        uid: String,
+        document_name: String,
+        document_hash: String
+    ) {
+        // Vérifier l'autorisation de l'organisation
+        authorized_org.require_auth();
+        
+        // Vérifier que l'organisation est un MRO, OEM ou le propriétaire
+        Self::ensure_can_add_document(env, &authorized_org, &uid);
+        
+        // Récupérer les pièces
+        let parts: Map<String, AeronauticPart> = env.storage().instance().get(&PARTS).unwrap_or(Map::new(env));
+        
+        // Vérifier que la pièce existe
+        let part = match parts.get(uid.clone()) {
+            Some(p) => p,
+            None => panic!("Part not found"),
+        };
+        
+        // Ajouter le document
+        let current_time = env.ledger().timestamp();
+        let mut updated_part = part.clone();
+        let mut updated_docs = updated_part.document_hashes.clone();
+        updated_docs.set(document_name.clone(), document_hash.clone());
+        updated_part.document_hashes = updated_docs;
+        updated_part.last_updated = current_time;
+        
+        // Mettre à jour le registre
+        let mut updated_parts = parts.clone();
+        updated_parts.set(uid.clone(), updated_part);
+        env.storage().instance().set(&PARTS, &updated_parts);
+        
+        // Prolonger la durée de vie du stockage
+        env.storage().instance().extend_ttl(1000, 6_307_200);
+        
+        log!(
+            env, 
+            "Added document: {} with hash: {} to part: {} by: {}", 
+            document_name, document_hash, uid, authorized_org
+        );
+    }
+    
+    // Fonctions d'aide privées
+    
+    // Vérifier si une adresse est un administrateur
+    fn ensure_is_admin(env: &Env, address: &Address) {
+        let admins: Vec<Address> = env.storage().instance().get(&ADMINS).unwrap_or(Vec::new(env));
+        
+        for admin in admins.iter() {
+            if &admin == address {
+                return;
+            }
+        }
+        
+        panic!("Not authorized as admin");
+    }
+    
+    // Vérifier si une adresse est un OEM enregistré
+    fn ensure_is_oem(env: &Env, address: &Address) {
+        let oem_orgs: Vec<Organization> = env.storage().instance().get(&OEM_ORGS).unwrap_or(Vec::new(env));
+        
+        for org in oem_orgs.iter() {
+            if &org.id == address && org.active {
+                return;
+            }
+        }
+        
+        panic!("Not an authorized OEM");
+    }
+    
+    // Vérifier si une adresse est un MRO ou le propriétaire d'une pièce
+    fn ensure_is_mro_or_owner(env: &Env, address: &Address, part_uid: &String) {
+        // Vérifier si c'est un MRO
+        let mro_orgs: Vec<Organization> = env.storage().instance().get(&MRO_ORGS).unwrap_or(Vec::new(env));
+        let mut is_mro = false;
+        
+        for org in mro_orgs.iter() {
+            if &org.id == address && org.active {
+                is_mro = true;
+                break;
+            }
+        }
+        
+        // Si ce n'est pas un MRO, vérifier si c'est le propriétaire
+        if !is_mro {
+            let parts: Map<String, AeronauticPart> = env.storage().instance().get(&PARTS).unwrap_or(Map::new(env));
+            
+            match parts.get(part_uid.clone()) {
+                Some(part) => {
+                    if &part.current_owner != address {
+                        panic!("Not authorized as MRO or owner");
+                    }
+                },
+                None => panic!("Part not found"),
+            }
+        }
+    }
+    
+    // Vérifier si une adresse peut ajouter un document (MRO, OEM ou propriétaire)
+    fn ensure_can_add_document(env: &Env, address: &Address, part_uid: &String) {
+        // Vérifier si c'est un MRO
+        let mro_orgs: Vec<Organization> = env.storage().instance().get(&MRO_ORGS).unwrap_or(Vec::new(env));
+        
+        for org in mro_orgs.iter() {
+            if &org.id == address && org.active {
+                return;
+            }
+        }
+        
+        // Vérifier si c'est un OEM
+        let oem_orgs: Vec<Organization> = env.storage().instance().get(&OEM_ORGS).unwrap_or(Vec::new(env));
+        
+        for org in oem_orgs.iter() {
+            if &org.id == address && org.active {
+                return;
+            }
+        }
+        
+        // Vérifier si c'est le propriétaire
+        let parts: Map<String, AeronauticPart> = env.storage().instance().get(&PARTS).unwrap_or(Map::new(env));
+        
+        match parts.get(part_uid.clone()) {
+            Some(part) => {
+                if &part.current_owner == address {
+                    return;
+                }
+            },
+            None => panic!("Part not found"),
+        }
+        
+        panic!("Not authorized to add documents");
+    }
+}
+
+#[cfg(test)]
+mod test;
